@@ -45,6 +45,13 @@ impl PathStats {
         self.outstanding.push_back((probe, now));
     }
 
+    /// The probe never left the host: forget it so it is not counted as network loss.
+    pub(crate) fn on_probe_send_failed(&mut self, probe: u32) {
+        if let Some(pos) = self.outstanding.iter().position(|(p, _)| *p == probe) {
+            let _ = self.outstanding.remove(pos);
+        }
+    }
+
     /// Records an answer. The RTT comes from our own send time, not from the echoed
     /// timestamp, so a forged Pong cannot fake low latency.
     pub(crate) fn on_pong(&mut self, probe: u32, now: Instant) -> Option<f64> {
@@ -282,5 +289,22 @@ mod rtt_tests {
             stream.on_down(t + Duration::from_millis(3));
         }
         assert!(stream.get().is_none(), "streaming flow must not report");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn unsent_probe_is_not_counted_as_loss() {
+        let t0 = Instant::now();
+        let mut s = PathStats::new();
+        s.on_probe_sent(1, t0);
+        s.on_probe_send_failed(1);
+        // Expiry long after: nothing outstanding, so no loss recorded.
+        s.on_probe_sent(2, t0 + Duration::from_secs(10));
+        assert_eq!(s.loss_pct(), 0.0);
+        assert!(s.on_pong(1, t0 + Duration::from_secs(10)).is_none());
     }
 }

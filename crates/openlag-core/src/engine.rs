@@ -445,12 +445,21 @@ impl Inner {
                 self.dropped_upstream.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let active = exit.active.lock().clone();
-            // While no route is confirmed (start-up, outage) try every route of the exit.
-            let targets = if active.is_empty() {
-                &exit.paths
-            } else {
-                &active
+            // Copy to the stack: no heap allocation per packet, lock not held while sending.
+            let mut stack = [0u16; 8];
+            let heap;
+            let targets: &[u16] = {
+                let a = exit.active.lock();
+                // While no route is confirmed (start-up, outage) try every route.
+                if a.is_empty() {
+                    &exit.paths
+                } else if a.len() <= stack.len() {
+                    stack[..a.len()].copy_from_slice(&a);
+                    &stack[..a.len()]
+                } else {
+                    heap = a.clone(); // shortcut: multipath > 8 allocates, rare
+                    &heap
+                }
             };
             let mut sent = false;
             for &pid in targets {
@@ -784,7 +793,9 @@ impl Inner {
                 }
                 // Record before sending so a fast answer always finds its probe.
                 path.stats.lock().on_probe_sent(probe, now);
-                let _ = path.socket.try_send_to(&buf, path.spec.via);
+                if path.socket.try_send_to(&buf, path.spec.via).is_err() {
+                    path.stats.lock().on_probe_send_failed(probe);
+                }
             }
             for exit in &self.exits {
                 self.reselect(exit, now);
