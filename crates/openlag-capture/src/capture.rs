@@ -14,6 +14,7 @@ use crate::packet::{
     rewrite_tcp_v4,
 };
 use crate::procmap::{ProcessMap, TCP, UDP, port_table};
+use crate::wfp::{WfpAppId, WfpEngine};
 use crate::windivert::{self as wd, Address, Handle};
 
 /// Which processes go through the tunnel.
@@ -90,6 +91,8 @@ struct Shared {
     blocked: AtomicU64,
     last_direct_note: Mutex<Option<std::time::Instant>>,
     last_reset_note: Mutex<Option<std::time::Instant>>,
+    wfp: Option<WfpEngine>,
+    blocked_wfp_paths: Mutex<HashSet<std::path::PathBuf>>,
 }
 
 /// Captures outbound traffic of the selected processes and injects answers back.
@@ -116,6 +119,16 @@ impl Capture {
         )?;
         let mut exclude_pids: HashSet<u32> = cfg.exclude_pids.iter().copied().collect();
         exclude_pids.insert(std::process::id());
+        let wfp = match WfpEngine::open() {
+            Ok(engine) => {
+                info!("WFP BFE engine session opened successfully");
+                Some(engine)
+            }
+            Err(e) => {
+                warn!("WFP engine not available ({e:#}); using user-mode fallback");
+                None
+            }
+        };
         let shared = Arc::new(Shared {
             names: cfg
                 .processes
@@ -152,6 +165,8 @@ impl Capture {
             blocked: AtomicU64::new(0),
             last_direct_note: Mutex::default(),
             last_reset_note: Mutex::default(),
+            wfp,
+            blocked_wfp_paths: Mutex::default(),
         });
 
         for (port, pid) in port_table(TCP) {
@@ -224,6 +239,11 @@ impl Capture {
             *self.shared.engine.write() = None;
             return;
         };
+        // Engine is online: unblock any applications that were blocked by WFP kill-switch
+        if let Some(wfp) = &self.shared.wfp {
+            wfp.clear_filters();
+            self.shared.blocked_wfp_paths.lock().clear();
+        }
         // Connections tunnelled under the previous selection or mode stay in the tunnel
         // until they close, and browsers, launchers and chats keep theirs open for
         // hours: it looked as if both modes ran at once. Cut those that no longer
@@ -258,6 +278,9 @@ impl Capture {
     /// Stops capturing. Packets flow normally again as soon as the handles close.
     pub fn stop(&mut self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
+        if let Some(wfp) = &self.shared.wfp {
+            wfp.clear_filters();
+        }
         self.shared.net.shutdown();
         self.sock.shutdown();
         for t in self.threads.drain(..) {
@@ -296,6 +319,36 @@ impl Shared {
     /// Must never leave outside the tunnel.
     fn strict(&self, name: &str) -> bool {
         self.kill_switch || self.protect.contains(name)
+    }
+
+    /// Enforces WFP ALE kernel blocking for a strict process when tunnel is down.
+    fn check_wfp_block(&self, pid: u32, name: &str) {
+        if !self.strict(name) {
+            return;
+        }
+        let Some(wfp) = &self.wfp else {
+            return;
+        };
+        let Some(path) = self.procs.path(pid) else {
+            return;
+        };
+        let mut blocked = self.blocked_wfp_paths.lock();
+        if blocked.contains(&path) {
+            return;
+        }
+        match WfpAppId::from_file_path(&path) {
+            Ok(app_id) => {
+                if let Ok(ids) = wfp.block_app(&app_id) {
+                    if !ids.is_empty() {
+                        info!("WFP kernel-level kill-switch activated for {name} ({path:?})");
+                        blocked.insert(path);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to resolve WFP AppId for {path:?}: {e:#}");
+            }
+        }
     }
 
     fn network_loop(&self) {
@@ -361,6 +414,7 @@ impl Shared {
         let Some(engine) = engine else {
             // Tunnel restarting or down.
             if strict {
+                self.check_wfp_block(pid, &name);
                 self.blocked.fetch_add(1, Ordering::Relaxed);
             }
             return strict;
@@ -386,6 +440,7 @@ impl Shared {
             }
             // Kill switch: swallow the packet rather than leak it outside the tunnel.
             Upstream::Direct if strict => {
+                self.check_wfp_block(pid, &name);
                 self.blocked.fetch_add(1, Ordering::Relaxed);
                 true
             }
@@ -440,6 +495,9 @@ impl Shared {
                 }
                 if !redirect && self.strict(&name) {
                     // Kill switch: drop the SYN; the program sees no connectivity.
+                    if let Some(pid) = self.procs.pid_for_port(TCP, t.src.port()) {
+                        self.check_wfp_block(pid, &name);
+                    }
                     self.blocked.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
@@ -475,6 +533,9 @@ impl Shared {
         let Some(name) = owner.filter(|n| self.strict(n) && !self.udp_only.contains(n)) else {
             return false;
         };
+        if let Some(pid) = self.procs.pid_for_port(TCP, t.src.port()) {
+            self.check_wfp_block(pid, &name);
+        }
         self.blocked.fetch_add(1, Ordering::Relaxed);
         if !t.syn
             && !t.rst

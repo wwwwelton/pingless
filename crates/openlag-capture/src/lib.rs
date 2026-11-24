@@ -16,9 +16,13 @@ mod capture;
 #[cfg(windows)]
 mod procmap;
 #[cfg(windows)]
+pub mod wfp;
+#[cfg(windows)]
 mod windivert;
 
 pub use packet::{TcpInfo, build_udp, is_local_scope, parse_tcp_v4, parse_udp, rewrite_tcp_v4};
 
 #[cfg(windows)]
 pub use capture::{Capture, CaptureConfig, CaptureStats, Selection};
+#[cfg(windows)]
+pub use wfp::{WfpAppId, WfpEngine};

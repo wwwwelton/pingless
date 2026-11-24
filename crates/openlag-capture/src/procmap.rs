@@ -43,6 +43,7 @@ pub struct ProcessMap {
 struct State {
     owners: HashMap<(u8, u16), u32>,
     names: HashMap<u32, (Option<String>, Instant)>,
+    paths: HashMap<u32, (Option<std::path::PathBuf>, Instant)>,
     last_snapshot: HashMap<u8, Instant>,
     last_recheck: HashMap<u8, Instant>,
 }
@@ -51,8 +52,9 @@ impl ProcessMap {
     pub fn on_bind(&self, proto: u8, port: u16, pid: u32) {
         let mut st = self.state.lock();
         if st.owners.insert((proto, port), pid) != Some(pid) {
-            // New owner: make sure its name is resolved fresh.
+            // New owner: make sure its name and path are resolved fresh.
             st.names.remove(&pid);
+            st.paths.remove(&pid);
         }
     }
 
@@ -114,6 +116,21 @@ impl ProcessMap {
             }
         }
         found
+    }
+
+    /// Full executable path for a process, if queryable.
+    pub fn path(&self, pid: u32) -> Option<std::path::PathBuf> {
+        let now = Instant::now();
+        let mut st = self.state.lock();
+        if let Some((path, at)) = st.paths.get(&pid) {
+            let ttl = if path.is_some() { NAME_TTL } else { NAME_FAIL_TTL };
+            if now - *at < ttl {
+                return path.clone();
+            }
+        }
+        let path = process_full_path(pid);
+        st.paths.insert(pid, (path.clone(), now));
+        path
     }
 
     /// Lower-case executable file name, e.g. `cs2.exe`.
@@ -202,6 +219,24 @@ fn raw_table(proto: u8, family: u32) -> Option<Vec<u8>> {
         size = buf.len() as u32;
     }
     None
+}
+
+fn process_full_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if pid == 0 || pid == 4 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        (ok != 0).then(|| std::ffi::OsString::from_wide(&buf[..len as usize]).into())
+    }
 }
 
 fn process_name(pid: u32) -> Option<String> {
